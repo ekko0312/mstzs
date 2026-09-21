@@ -1,0 +1,8 @@
+.env
+.env.example
+.streamlit/secrets.toml
+.venv/
+__pycache__/
+*.py[cod]
+data/trainer.db
+.sites-runtime/
