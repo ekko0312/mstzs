@@ -17,7 +17,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).parent
 DB_PATH = ROOT / "data" / "trainer.db"
-QUESTIONS_JSON = ROOT / "data" / "questions.json"
+QUESTIONS_JSON = ROOT / "questions.json"
 
 
 # ------------------------------------------------------------ 时间统一走 UTC
