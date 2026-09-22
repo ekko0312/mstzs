@@ -9,6 +9,9 @@ import hmac
 import json
 import os
 import time
+import json as _json
+import urllib.error
+import urllib.request
 from datetime import datetime
 
 import pandas as pd
@@ -16,6 +19,7 @@ import streamlit as st
 
 import grader
 import store
+from supabase_store import SupabaseStore
 
 st.set_page_config(
     page_title="面试题背题助手",
@@ -131,10 +135,75 @@ def require_access() -> None:
 require_access()
 
 
+def _cloud_config() -> tuple[str, str]:
+    """Return Supabase public connection settings, or blanks during local development."""
+    try:
+        url = str(st.secrets.get("SUPABASE_URL", "")).strip()
+        key = str(st.secrets.get("SUPABASE_ANON_KEY", "")).strip()
+    except Exception:
+        url, key = "", ""
+    return url or os.getenv("SUPABASE_URL", ""), key or os.getenv("SUPABASE_ANON_KEY", "")
+
+
+def _supabase_auth(url: str, key: str, action: str, email: str, password: str) -> dict:
+    data = _json.dumps({"email": email, "password": password}).encode("utf-8")
+    req = urllib.request.Request(
+        f"{url.rstrip('/')}/auth/v1/{action}", data=data, method="POST",
+        headers={"apikey": key, "Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=20) as res:
+            return _json.loads(res.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        detail = _json.loads(exc.read().decode("utf-8", errors="replace"))
+        raise ValueError(detail.get("msg") or detail.get("message") or "登录失败") from exc
+
+
+def require_user() -> None:
+    """Enable per-person accounts only when the cloud database has been configured."""
+    global store
+    url, key = _cloud_config()
+    if not (url and key):
+        return
+    if "cloud_user" not in st.session_state:
+        st.markdown('<div class="practice-kicker">PERSONAL STUDY SPACE</div><div class="practice-title">登录后保存你的错题本</div>', unsafe_allow_html=True)
+        tab_login, tab_register = st.tabs(["登录", "注册"])
+        with tab_login:
+            email = st.text_input("邮箱", key="login_email")
+            password = st.text_input("密码", type="password", key="login_password")
+            if st.button("登录", type="primary", width="stretch"):
+                try:
+                    data = _supabase_auth(url, key, "token?grant_type=password", email, password)
+                    st.session_state["cloud_user"] = {"id": data["user"]["id"], "token": data["access_token"], "email": data["user"]["email"]}
+                    st.rerun()
+                except (ValueError, KeyError) as exc:
+                    st.error(str(exc))
+        with tab_register:
+            email = st.text_input("邮箱", key="register_email")
+            password = st.text_input("设置密码（至少 6 位）", type="password", key="register_password")
+            if st.button("注册账号", type="primary", width="stretch"):
+                try:
+                    data = _supabase_auth(url, key, "signup", email, password)
+                    if data.get("access_token"):
+                        st.session_state["cloud_user"] = {"id": data["user"]["id"], "token": data["access_token"], "email": data["user"]["email"]}
+                        st.rerun()
+                    st.success("注册成功，请到邮箱点击验证链接后再登录。")
+                except ValueError as exc:
+                    st.error(str(exc))
+        st.stop()
+    user = st.session_state["cloud_user"]
+    store = SupabaseStore(url, key, user["token"], user["id"])
+
+
+require_user()
+
+
 # ------------------------------------------------------------------ 初始化
 
 @st.cache_resource
 def _bootstrap() -> dict:
+    if isinstance(store, SupabaseStore):
+        return {"imported": 0, "ready": True}
     store.init_db()
     n = store.import_questions()
     return {"imported": n, "ready": True}
@@ -177,6 +246,13 @@ def _filters_changed() -> None:
 def render_sidebar() -> None:
     with st.sidebar:
         st.markdown("### 🎯 面试题背题助手")
+
+        if "cloud_user" in st.session_state:
+            st.caption(f"👤 {st.session_state['cloud_user']['email']}")
+            if st.button("退出登录", width="stretch"):
+                del st.session_state["cloud_user"]
+                st.rerun()
+            st.divider()
 
         ov = store.stats_overview()
         c1, c2 = st.columns(2)
