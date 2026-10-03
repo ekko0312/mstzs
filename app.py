@@ -16,6 +16,7 @@ import streamlit as st
 
 import grader
 import store
+from answer_display import render_reference_answer
 from supabase_store import SupabaseStore, ReviewScheduleError
 from cloud_connection import CloudServiceError, auth_request
 
@@ -66,6 +67,19 @@ CSS = """
       text-transform: uppercase; margin-bottom: 6px; }
   .q-card .q-text { font-size:1.3rem; font-weight:680; color:var(--ink); line-height:1.55; letter-spacing:-.015em; }
   .q-meta { font-size:.8rem; color:var(--muted); margin-top:13px; }
+  /* 「承接上文」块：给追问补前因。
+     文档里大量题目是追问（"为什么不选择二叉树？"），脱离上下文没法答，
+     这块就是告诉用户"这道题在跟什么比、它属于哪一串问题"。 */
+  .q-ctx { border-left:3px solid #C7CDFF; background:#F7F8FE; border-radius:0 10px 10px 0;
+      padding:10px 14px; margin:0 0 14px; font-size:.88rem; line-height:1.62; color:#3F4A63; }
+  .q-ctx .ctx-row { display:flex; gap:8px; align-items:baseline; }
+  .q-ctx .ctx-k { flex:0 0 auto; font-weight:750; color:#4546C7; font-size:.78rem;
+      letter-spacing:.03em; }
+  .q-ctx .ctx-v { font-weight:620; color:#2A3350; }
+  .q-ctx .ctx-topic { margin-top:7px; padding-top:7px; border-top:1px dashed #DCE0F2;
+      color:#6B7690; font-size:.82rem; line-height:1.55; }
+  .q-ctx .ctx-k2 { font-weight:700; color:#8A93AC; margin-right:7px; font-size:.76rem; }
+  .q-ctx .ctx-focus { margin-top:6px; color:#46516B; }
   .tag { display:inline-block; background:#EEF0FF; color:#4546C7; border-radius:999px;
       padding:3px 10px; font-size:.75rem; margin:3px 6px 0 0; font-weight:600;}
   .tag.gray { background:#F1F3F7; color:#59647A; }
@@ -83,6 +97,26 @@ CSS = """
   .pt-ev { color:#475569; font-size:.85rem; margin-top:4px; }
   .pt-ev b { color:#0F172A; }
 
+  .answer-layout { color:var(--ink); font-size:.95rem; line-height:1.75; }
+  .answer-section { margin:0 0 16px; }
+  .answer-heading { margin:18px 0 8px; padding-left:10px; border-left:3px solid var(--brand);
+      color:#373AA3; font-size:1rem; font-weight:750; }
+  .answer-points { border:1px solid var(--line); border-radius:12px; background:#fff; overflow:hidden; }
+  .answer-point { display:flex; align-items:flex-start; gap:12px; padding:12px 15px; }
+  .answer-point + .answer-point { border-top:1px solid #EDF0F6; }
+  .answer-index { flex:0 0 auto; min-width:25px; color:var(--brand); font-size:.78rem;
+      font-weight:750; line-height:1.9; }
+  .answer-body { min-width:0; overflow-wrap:anywhere; }
+  .answer-body p, .answer-extra-item p { margin:0 0 7px; }
+  .answer-body p:last-child, .answer-extra-item p:last-child { margin-bottom:0; }
+  .answer-code { margin:2px 0; padding:10px 12px; border-radius:8px; background:#F5F7FB;
+      overflow-x:auto; white-space:pre-wrap; overflow-wrap:anywhere; font-size:.84rem; line-height:1.55; }
+  .answer-extra { margin:14px 0 0; padding:11px 14px; background:#F8FAFD;
+      border:1px solid var(--line); border-radius:10px; color:#526078; }
+  .answer-extra summary { cursor:pointer; font-weight:700; color:#48536D; }
+  .answer-extra-item { padding:10px 0 0 12px; border-left:2px solid #D9DEEA; margin-top:10px; }
+  .answer-empty { padding:14px; color:var(--muted); }
+
   .fb { background:#EFF6FF; border:1px solid #BFDBFE; border-radius:10px;
         padding:16px 20px; font-size:.95rem; line-height:1.75; color:#1E293B; }
 
@@ -96,6 +130,7 @@ CSS = """
       .q-card { padding:18px 17px; border-radius:12px; }
       .q-card .q-text { font-size:1.12rem; }
       .score-num { font-size:2rem; }
+      .answer-point { gap:9px; padding:11px 12px; }
       div[data-testid="stHorizontalBlock"] { gap:.45rem; }
   }
 </style>
@@ -207,7 +242,7 @@ def ensure_state() -> None:
         "started_at": None,       # 本题开始时间
         "answer_text": "",        # 输入框内容（纯状态，不做 widget key）
         "answer_nonce": 0,        # 换题计数器：递增即强制输入框重建为空
-        "cat_filter": "全部",
+        "cat_filter": "技术题库",
         "mode": "due",
         "show_answer": False,     # 是否已放弃并看答案
         "session_done": 0,        # 本次会话已做题数
@@ -249,18 +284,32 @@ def render_sidebar() -> None:
         c1, c2 = st.columns(2)
         c1.markdown(
             f'<div class="stat-card"><div class="stat-num">{ov["learned"]}</div>'
-            f'<div class="stat-lbl">已背 / 共 {ov["total"]}</div></div>',
+            f'<div class="stat-lbl">全库已背 / 共 {ov["total"]}</div></div>',
             unsafe_allow_html=True)
         c2.markdown(
             f'<div class="stat-card"><div class="stat-num">{ov["streak_days"]}</div>'
             f'<div class="stat-lbl">连续打卡(天)</div></div>',
             unsafe_allow_html=True)
 
-        st.progress(ov["progress"] / 100, text=f"整体进度 {ov['progress']}%")
+        st.progress(ov["progress"] / 100, text=f"全库进度 {ov['progress']}%")
         st.caption("")
 
-        cats = ["全部"] + [c for c, _ in store.list_categories()]
-        st.selectbox("分类", cats, key="cat_filter", on_change=_filters_changed)
+        # 旧会话里的「全部」会包含 HR 题；升级后统一转为技术题库。
+        if st.session_state.get("cat_filter") == "全部":
+            st.session_state["cat_filter"] = "技术题库"
+            current = st.session_state.get("current")
+            if current and current["category"] == "软技能/HR":
+                _filters_changed()
+        tech_cats = [c for c, _ in store.list_categories() if c != "软技能/HR"]
+        cats = ["技术题库"] + tech_cats + ["软技能/HR"]
+        st.selectbox(
+            "题库 / 分类", cats, key="cat_filter", on_change=_filters_changed,
+            format_func=lambda c: (
+                "技术题库（默认）" if c == "技术题库" else
+                "非技术题库（主动选择）" if c == "软技能/HR" else c
+            ),
+        )
+        st.caption("非技术题只在选中“非技术题库”时出题。")
 
         st.radio(
             "出题模式",
@@ -277,7 +326,8 @@ def render_sidebar() -> None:
 
         pc = store.pending_count(st.session_state["cat_filter"])
         st.caption(
-            f"待复习 **{pc['due']}** · 新题 **{pc['new']}** · 错题 **{pc['wrong']}**")
+            f"当前题库 **{pc['total']}** 道 · 待复习 **{pc['due']}** · "
+            f"新题 **{pc['new']}** · 错题 **{pc['wrong']}**")
 
         st.divider()
 
@@ -392,8 +442,17 @@ def _reset_answer_box() -> None:
     st.session_state["answer_text"] = ""
 
 
+def _current_matches_pool(q: dict, category: str) -> bool:
+    if category in ("技术题库", "全部"):
+        return q["category"] != "软技能/HR"
+    return q["category"] == category
+
+
 def _load_next(force: bool = False) -> None:
-    if st.session_state["current"] is not None and not force:
+    current = st.session_state["current"]
+    if current is not None and not force and _current_matches_pool(
+        current, st.session_state["cat_filter"]
+    ):
         return
     # 把当前题号传下去，否则在"这题还没有作答记录"时（比如点了「不会，看答案」）
     # 查出来的还是同一道题 —— 就是"切不了下一题"的根因
@@ -505,16 +564,65 @@ def render_result(res: dict, q: dict) -> None:
 
     # ---- 参考答案 ----
     with st.expander("📖 查看参考答案全文"):
-        for i, p in enumerate(q["rubric"], 1):
-            st.markdown(f"**{i}.** {p}")
-        if q.get("extra_points"):
-            st.markdown("---")
-            st.caption("补充说明")
-            for e in q["extra_points"]:
-                st.caption(f"· {e}")
+        st.markdown(render_reference_answer(q), unsafe_allow_html=True)
 
 
 # ------------------------------------------------------------------ 页面：背题
+
+def context_html(q: dict) -> str:
+    """展示原笔记的有效前因，或人工澄清的场景与回答方向。"""
+    ctx = q.get("context") or {}
+    scene = (ctx.get("scene") or "").strip()
+    focus = (ctx.get("focus") or "").strip()
+    lead = (ctx.get("lead") or "").strip()
+    topic = (ctx.get("topic") or "").strip()
+    if not any((scene, focus, lead, topic)):
+        return ""
+
+    rows = []
+    if scene:
+        rows.append(
+            f'<div class="ctx-row"><span class="ctx-k">题目场景</span>'
+            f'<span class="ctx-v">{html.escape(scene)}</span></div>'
+        )
+    elif lead:
+        rows.append(
+            f'<div class="ctx-row"><span class="ctx-k">承接上文</span>'
+            f'<span class="ctx-v">{html.escape(lead)}</span></div>'
+        )
+    if not scene and topic and not (lead and lead in topic):
+        rows.append(
+            f'<div class="ctx-topic" title="{html.escape(topic)}">'
+            f'<span class="ctx-k2">本组话题</span>{html.escape(topic)}</div>'
+        )
+    if focus:
+        rows.append(
+            f'<div class="ctx-row ctx-focus"><span class="ctx-k">回答方向</span>'
+            f'<span>{html.escape(focus)}</span></div>'
+        )
+    if not rows:
+        return ""
+    return f'<div class="q-ctx">{"".join(rows)}</div>'
+
+
+def question_with_context(q: dict) -> str:
+    """判分时把前因一起交给模型。
+
+    不这么做的后果：模型看到孤零零一句「为什么不选择二叉树？」，
+    不知道前提是"在给 MySQL 索引选数据结构"，判分尺度会飘。
+    """
+    ctx = q.get("context") or {}
+    scene = (ctx.get("scene") or "").strip()
+    lead = (ctx.get("lead") or "").strip()
+    topic = (ctx.get("topic") or "").strip()
+    if scene:
+        return f"（题目场景：{scene}）{q['question']}"
+    if lead:
+        return f"（承接上文：{lead}）{q['question']}"
+    if topic:
+        return f"（本组话题：{topic}）{q['question']}"
+    return q["question"]
+
 
 def page_practice() -> None:
     global _answer_widget_rendered
@@ -542,6 +650,7 @@ def page_practice() -> None:
     st.markdown(
         f'<div class="q-card">'
         f'<div class="q-label">题目</div>'
+        f'{context_html(q)}'
         f'<div class="q-text">{html.escape(q["question"])}</div>'
         f'<div class="q-meta"><span class="tag">{html.escape(q["category"])}</span>'
         f'<span class="tag gray">{q["date"]}</span>'
@@ -574,9 +683,10 @@ def page_practice() -> None:
                 st.warning("先写点东西再提交吧，哪怕只记得个大概。")
             else:
                 elapsed = int(time.time() - (st.session_state["started_at"] or time.time()))
-                with st.spinner("AI 正在逐条对照要点判分…"):
+                with st.spinner("AI 正在判断答案并评分…"):
                     try:
-                        r = grader.grade(q["question"], q["rubric"], answer)
+                        r = grader.grade(question_with_context(q), q.get("rubric") or [], answer,
+                                         extra_points=q.get("extra_points") or [])
                     except Exception as e:               # noqa: BLE001
                         st.error(f"判分失败：{e}")
                         r = None
@@ -601,12 +711,7 @@ def page_practice() -> None:
         if st.session_state["show_answer"]:
             st.divider()
             st.markdown("##### 📖 参考答案")
-            for i, p in enumerate(q["rubric"], 1):
-                st.markdown(f"**{i}.** {p}")
-            if q.get("extra_points"):
-                with st.expander("补充说明"):
-                    for e in q["extra_points"]:
-                        st.caption(f"· {e}")
+            st.markdown(render_reference_answer(q), unsafe_allow_html=True)
             if st.button("我记住了，下一题 →", type="primary"):
                 # 看了答案才过的题，要落一条记录让它进入复习队列，
                 # 否则它的 card_state 永远为空，会被当成"新题"反复取出来。
@@ -652,6 +757,57 @@ def page_practice() -> None:
         c3.caption("判分不满意？点「重答这道」再来一遍，两次都会被记入统计。")
 
 
+# ------------------------------------------------------------------ 页面：查题
+
+def page_search() -> None:
+    st.markdown("### 🔎 主动查题")
+    st.caption("输入关键词，找到题目后直接查看参考答案。支持搜索题干、答案和上下文；多个关键词用空格分隔。")
+
+    col_query, col_category = st.columns([3, 1])
+    query = col_query.text_input(
+        "搜索关键词", key="question_search_query",
+        placeholder="例如：HashMap、索引、线程池，或 Redis 持久化",
+        help="按回车或点击“搜索”即可查询，英文不区分大小写。",
+    )
+    categories = ["技术题库", "全部题库"] + [c for c, _ in store.list_categories()]
+    category = col_category.selectbox(
+        "搜索范围", categories, key="question_search_category",
+        format_func=lambda c: "非技术题库（HR / 行为题）" if c == "软技能/HR" else c,
+    )
+    st.button("搜索", type="primary", key="question_search_submit")
+
+    if not query.strip():
+        st.info("输入你想查的知识点，例如“HashMap”或“索引”。")
+        return
+
+    results = store.search_questions(query, category)
+    if not results:
+        st.warning("没有找到匹配的题目。试试更短的关键词、减少关键词，或将搜索范围切换为“全部题库”。")
+        return
+
+    st.caption(f"找到 **{len(results)}** 道题，题干匹配的结果优先显示。选择题目即可查看答案。")
+    by_id = {q["id"]: q for q in results}
+    ids = list(by_id)
+    # 查询或分类改变后，保留仍然匹配的选择，否则显示第一条结果。
+    if st.session_state.get("question_search_selected") not in by_id:
+        st.session_state["question_search_selected"] = ids[0]
+    selected = st.selectbox(
+        "匹配题目", ids, key="question_search_selected",
+        format_func=lambda qid: f"【{by_id[qid]['category']}】{by_id[qid]['question']}",
+    )
+    q = by_id[selected]
+    st.markdown(
+        '<div class="q-card"><div class="q-label">题目</div>'
+        f'{context_html(q)}'
+        f'<div class="q-text">{html.escape(q["question"])}</div>'
+        f'<div class="q-meta"><span class="tag">{html.escape(q["category"])}</span>'
+        f'<span class="tag gray">{html.escape(str(q.get("date", "")))}</span></div></div>',
+        unsafe_allow_html=True,
+    )
+    st.markdown("##### 📖 参考答案")
+    st.markdown(render_reference_answer(q), unsafe_allow_html=True)
+
+
 # ------------------------------------------------------------------ 页面：错题集
 
 def page_wrong() -> None:
@@ -660,7 +816,8 @@ def page_wrong() -> None:
 
     col1, _ = st.columns([1, 3])
     only_un = col1.checkbox("只看还没攻克的（最低分 < 60）", value=True)
-    rows = store.wrong_book(only_unmastered=only_un)
+    rows = store.wrong_book(
+        only_unmastered=only_un, category=st.session_state["cat_filter"])
 
     if not rows:
         st.success("错题集是空的 —— 要么还没背过，要么都答得不错。")
@@ -682,6 +839,8 @@ def page_wrong() -> None:
             c4.metric("答错次数", int(r["fail_times"]))
 
             st.markdown("**题目**  \n" + r["question"])
+            if context_html(r):
+                st.markdown(context_html(r), unsafe_allow_html=True)
 
             if r["last_miss"]:
                 st.markdown("**上次漏掉的要点**")
@@ -696,8 +855,7 @@ def page_wrong() -> None:
             q = store.get_question(r["id"])
             if q:
                 with st.expander("📖 参考答案全文"):
-                    for i, p in enumerate(q["rubric"], 1):
-                        st.markdown(f"**{i}.** {p}")
+                    st.markdown(render_reference_answer(q), unsafe_allow_html=True)
 
             if st.button("🎯 专项练这道", key=f"practice_{r['id']}"):
                 st.session_state["current"] = q
@@ -824,18 +982,23 @@ def page_stats() -> None:
 # ------------------------------------------------------------------ 主入口
 
 def main() -> None:
+    # Keep selected filters when an outage prevents their widgets from rendering.
+    for name in ("cat_filter", "mode"):
+        st.session_state[name] = st.session_state[name]
     render_sidebar()
 
     nav = st.radio(
-        "导航", ["背题", "错题集", "统计"],
+        "导航", ["背题", "查题", "错题集", "统计"],
         horizontal=True, label_visibility="collapsed",
-        index=["背题", "错题集", "统计"].index(st.session_state.get("_nav", "背题")),
+        index=["背题", "查题", "错题集", "统计"].index(st.session_state.get("_nav", "背题")),
     )
     st.session_state["_nav"] = nav
     st.caption("")
 
     if nav == "背题":
         page_practice()
+    elif nav == "查题":
+        page_search()
     elif nav == "错题集":
         page_wrong()
     else:

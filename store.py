@@ -8,16 +8,22 @@ reviews       每一次作答记录（我的答案 / AI 评分明细 / 用时）
 card_state    每道题的 FSRS 记忆状态（调度用）
 """
 
+import hashlib
 import json
 import random as _random
 import sqlite3
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
+from functools import lru_cache
 from pathlib import Path
+
+from question_search import search_questions as _search_questions
 
 ROOT = Path(__file__).parent
 DB_PATH = ROOT / "data" / "trainer.db"
 QUESTIONS_JSON = ROOT / "questions.json"
+TECHNICAL_POOL = "技术题库"
+NONTECH_CATEGORY = "软技能/HR"
 
 
 # ------------------------------------------------------------ 时间统一走 UTC
@@ -63,9 +69,16 @@ CREATE TABLE IF NOT EXISTS questions (
     rubric        TEXT NOT NULL,      -- JSON: 打分点列表
     extra_points  TEXT NOT NULL,      -- JSON: 补充说明（不计分，给 AI 参考）
     category      TEXT NOT NULL,
-    seq           INTEGER NOT NULL    -- 文档原始顺序
+    seq           INTEGER NOT NULL,   -- 文档原始顺序
+    context       TEXT NOT NULL DEFAULT '{}'   -- JSON: 承接上文 {topic, lead}
 );
 CREATE INDEX IF NOT EXISTS idx_q_cat ON questions(category);
+
+-- 记录题库文件的内容指纹，用来判断要不要重新导入
+CREATE TABLE IF NOT EXISTS meta (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
 
 CREATE TABLE IF NOT EXISTS reviews (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -113,21 +126,62 @@ def conn():
         c.close()
 
 
+def _ensure_columns(c: sqlite3.Connection) -> None:
+    """给老库补列。
+
+    CREATE TABLE IF NOT EXISTS 对已存在的表不做任何事，
+    所以新增字段必须在建表之后再补一次 ALTER TABLE，
+    否则老用户的 data/trainer.db 会缺列直接报错。
+    """
+    cols = {r[1] for r in c.execute("PRAGMA table_info(questions)")}
+    if "context" not in cols:
+        c.execute(
+            "ALTER TABLE questions ADD COLUMN context TEXT NOT NULL DEFAULT '{}'"
+        )
+
+
 def init_db() -> None:
     with conn() as c:
         c.executescript(SCHEMA)
+        _ensure_columns(c)
+
+
+def _questions_fingerprint() -> str:
+    """questions.json 的内容指纹，用来判断题库有没有变过。"""
+    return hashlib.sha1(QUESTIONS_JSON.read_bytes()).hexdigest()
+
+
+@lru_cache(maxsize=1)
+def _core_points_by_id() -> dict[str, list[str]]:
+    """显示答案时使用原文分行；rubric 仍只用于评分。"""
+    data = json.loads(QUESTIONS_JSON.read_text(encoding="utf-8"))
+    return {q["id"]: q.get("core_points", []) for q in data}
 
 
 def import_questions(force: bool = False) -> int:
-    """把 questions.json 导入 questions 表。force=True 时清空重导（保留复习记录）。"""
+    """把 questions.json 导入 questions 表。
+
+    force=False 时只在「题库文件内容变过」才重导（比对指纹）。
+    这样重跑 parse_docx.py 改完题库，重启服务就自动生效，
+    不用手动删库。返回本次导入的条数，跳过则返回 0。
+
+    重导只清空 questions 表；reviews（作答记录）和 card_state（记忆状态）
+    都是按 question_id 独立存的，复习进度不会丢——前提是题目 id 稳定，
+    所以 parse_docx.py 里题目的顺序和 id 不能随意改。
+    """
     init_db()
-    data = json.loads(QUESTIONS_JSON.read_text(encoding="utf-8"))
+    fingerprint = _questions_fingerprint()
     with conn() as c:
-        if force:
-            c.execute("DELETE FROM questions")
-        cur = c.execute("SELECT COUNT(*) n FROM questions")
-        if cur.fetchone()["n"] > 0 and not force:
-            return 0
+        has_rows = c.execute("SELECT COUNT(*) n FROM questions").fetchone()["n"] > 0
+        if has_rows and not force:
+            row = c.execute(
+                "SELECT value FROM meta WHERE key='questions_fp'"
+            ).fetchone()
+            if row and row["value"] == fingerprint:
+                return 0
+
+        data = json.loads(QUESTIONS_JSON.read_text(encoding="utf-8"))
+        c.execute("DELETE FROM questions")
         rows = []
         for i, q in enumerate(data, 1):
             answer_text = "\n".join(q["core_points"] + q["extra_points"])
@@ -136,12 +190,16 @@ def import_questions(force: bool = False) -> int:
                 json.dumps(q["rubric"], ensure_ascii=False),
                 json.dumps(q["extra_points"], ensure_ascii=False),
                 q["category"], i,
+                json.dumps(q.get("context") or {}, ensure_ascii=False),
             ))
         c.executemany(
             "INSERT OR REPLACE INTO questions"
-            "(id,date,question,answer_text,rubric,extra_points,category,seq)"
-            " VALUES(?,?,?,?,?,?,?,?)", rows,
+            "(id,date,question,answer_text,rubric,extra_points,category,seq,context)"
+            " VALUES(?,?,?,?,?,?,?,?,?)", rows,
         )
+        c.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('questions_fp',?)",
+                  (fingerprint,))
+        _core_points_by_id.cache_clear()
         return len(rows)
 
 
@@ -350,10 +408,21 @@ def get_question(qid: str) -> dict | None:
     return _row_to_q(r) if r else None
 
 
+def search_questions(query: str, category: str | None = TECHNICAL_POOL) -> list[dict]:
+    """搜索题干、答案和上下文，只读取题库。"""
+    with conn() as c:
+        rows = c.execute("SELECT * FROM questions ORDER BY seq, id").fetchall()
+    return _search_questions((_row_to_q(row) for row in rows), query, category)
+
+
 def _row_to_q(r: sqlite3.Row) -> dict:
     d = dict(r)
     d["rubric"] = json.loads(d["rubric"])
     d["extra_points"] = json.loads(d["extra_points"])
+    d["core_points"] = _core_points_by_id().get(d["id"], [])
+    # context 是后加的列；错题集等查询没 SELECT 它时给个空 dict，
+    # 免得调用方到处写 .get(...)。
+    d["context"] = json.loads(d.get("context") or "{}")
     return d
 
 
@@ -364,6 +433,13 @@ def list_categories() -> list[tuple[str, int]]:
             "SELECT category, COUNT(*) n FROM questions GROUP BY category ORDER BY n DESC"
         ).fetchall()
     return [(r["category"], r["n"]) for r in rows]
+
+
+def _category_filter(category: str | None) -> tuple[str, list[str]]:
+    """默认只取技术题；选中 HR 分类后才进入非技术题库。"""
+    if category in (None, "全部", TECHNICAL_POOL):
+        return " AND q.category != ? ", [NONTECH_CATEGORY]
+    return " AND q.category = ? ", [category]
 
 
 def next_question(category: str | None = None, mode: str = "due",
@@ -386,8 +462,7 @@ def next_question(category: str | None = None, mode: str = "due",
     # due 存的是 UTC，比较也必须用 UTC（用本地时间会差 8 小时，
     # 导致刚答完的题立刻又被判定为到期）
     now = _utc_now_iso()
-    cat_clause = " AND q.category = ? " if category and category != "全部" else ""
-    cat_args = [category] if cat_clause else []
+    cat_clause, cat_args = _category_filter(category)
     order_clause = " ORDER BY q.seq"
 
     # 排除当前题：SQL 片段 + 绑定参数（放在 cat 参数之前）
@@ -477,10 +552,9 @@ def pending_count(category: str | None = None) -> dict:
     init_db()
     # 与 due 的存储口径保持一致：UTC
     now = _utc_now_iso()
-    cat_clause = " AND category = ? " if category and category != "全部" else ""
-    cat_args = [category] if cat_clause else []
+    cat_clause, cat_args = _category_filter(category)
     with conn() as c:
-        total = c.execute(f"SELECT COUNT(*) n FROM questions WHERE 1=1{cat_clause}",
+        total = c.execute(f"SELECT COUNT(*) n FROM questions q WHERE 1=1{cat_clause}",
                           cat_args).fetchone()["n"]
         learned = c.execute(
             f"SELECT COUNT(*) n FROM card_state s JOIN questions q ON q.id=s.question_id"
@@ -565,13 +639,15 @@ def category_progress() -> list[dict]:
     } for r in rows]
 
 
-def wrong_book(limit: int = 300, only_unmastered: bool = True) -> list[dict]:
+def wrong_book(limit: int = 300, only_unmastered: bool = True,
+               category: str | None = None) -> list[dict]:
     """错题集：按「最低分」升序（最惨的排前面），带答错次数。"""
     init_db()
     having = "HAVING MIN(r.score) < 60" if only_unmastered else ""
+    cat_clause, cat_args = _category_filter(category)
     with conn() as c:
         rows = c.execute(f"""
-            SELECT q.id, q.category, q.question,
+            SELECT q.id, q.category, q.question, q.context,
                    MIN(r.score)   minscore,
                    MAX(r.score)   maxscore,
                    COUNT(r.id)    times,
@@ -582,13 +658,15 @@ def wrong_book(limit: int = 300, only_unmastered: bool = True) -> list[dict]:
                    (SELECT feedback FROM reviews r3
                      WHERE r3.question_id=q.id ORDER BY r3.created_at DESC LIMIT 1) last_feedback
             FROM questions q JOIN reviews r ON q.id = r.question_id
+            WHERE 1=1{cat_clause}
             GROUP BY q.id {having}
             ORDER BY minscore ASC, fail_times DESC LIMIT ?
-        """, (limit,)).fetchall()
+        """, cat_args + [limit]).fetchall()
     out = []
     for r in rows:
         d = dict(r)
         d["last_miss"] = json.loads(d["last_miss"]) if d["last_miss"] else []
+        d["context"] = json.loads(d.get("context") or "{}")
         out.append(d)
     return out
 

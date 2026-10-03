@@ -14,10 +14,13 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from cloud_connection import CloudServiceError, request_json
+from question_search import search_questions as _search_questions
 
 ROOT = Path(__file__).parent
 QUESTIONS_JSON = ROOT / "questions.json"
 SKIPPED_GRADE = "skipped"
+TECHNICAL_POOL = "技术题库"
+NONTECH_CATEGORY = "软技能/HR"
 
 
 def _now() -> str:
@@ -77,15 +80,21 @@ class SupabaseStore:
     def get_question(self, qid):
         return self.by_id.get(qid)
 
+    def search_questions(self, query, category=TECHNICAL_POOL):
+        """关键词搜索使用随应用发布的题库，无需请求云端。"""
+        return _search_questions(self.questions, query, category)
+
     @staticmethod
     def score_to_grade(score: float) -> str:
-        if score >= 90: return "easy"
-        if score >= 75: return "good"
-        if score >= 60: return "hard"
+        if score >= 85: return "easy"
+        if score >= 70: return "good"
+        if score >= 50: return "hard"
         return "again"
 
     def _filtered(self, category):
-        return [q for q in self.questions if not category or category == "全部" or q["category"] == category]
+        if category in (None, "全部", TECHNICAL_POOL):
+            return [q for q in self.questions if q["category"] != NONTECH_CATEGORY]
+        return [q for q in self.questions if q["category"] == category]
 
     def next_question(self, category=None, mode="due", exclude_id=None):
         qs = self._filtered(category)
@@ -191,17 +200,19 @@ class SupabaseStore:
                         "rate": round(learned/total*100, 1) if total else 0})
         return out
 
-    def wrong_book(self, limit=300, only_unmastered=True):
+    def wrong_book(self, limit=300, only_unmastered=True, category=None):
         grouped = {}
         for r in self._reviews(): grouped.setdefault(r["question_id"], []).append(r)
+        allowed = {q["id"] for q in self._filtered(category)}
         out = []
         for qid, rs in grouped.items():
+            if qid not in allowed: continue
             scores = [float(r["score"]) for r in rs]
             if only_unmastered and min(scores) >= 60: continue
             q = self.by_id.get(qid)
             if not q: continue
             last = max(rs, key=lambda r: r["created_at"])
-            out.append({"id": qid, "category": q["category"], "question": q["question"], "minscore": min(scores), "maxscore": max(scores), "times": len(rs), "fail_times": sum(x < 60 for x in scores), "last_at": last["created_at"], "last_miss": last.get("miss_points", []), "last_feedback": last.get("feedback", "")})
+            out.append({"id": qid, "category": q["category"], "question": q["question"], "context": q.get("context") or {}, "minscore": min(scores), "maxscore": max(scores), "times": len(rs), "fail_times": sum(x < 60 for x in scores), "last_at": last["created_at"], "last_miss": last.get("miss_points", []), "last_feedback": last.get("feedback", "")})
         return sorted(out, key=lambda r: (r["minscore"], -r["fail_times"]))[:limit]
 
     def score_trend(self, days=30):

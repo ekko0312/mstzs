@@ -32,6 +32,9 @@ QUESTION = {
     "category": "测试分类",
     "date": "2026-10-01",
     "question": "解释测试知识点",
+    "seq": 1,
+    "context": {},
+    "core_points": ["测试要点一", "测试要点二"],
     "rubric": ["测试要点一", "测试要点二"],
     "extra_points": [],
 }
@@ -67,7 +70,7 @@ class JsonResponse:
         return json.dumps(self.data).encode("utf-8")
 
 
-class CloudAppTests(unittest.TestCase):
+class CloudAppHarness(unittest.TestCase):
     def setUp(self):
         self.stack = ExitStack()
         self.addCleanup(self.stack.close)
@@ -131,6 +134,8 @@ class CloudAppTests(unittest.TestCase):
         self.assertNotIn(USER["token"], self.rendered(app))
         self.assertNotIn(FAKE_SECRETS["SUPABASE_ANON_KEY"], self.rendered(app))
 
+
+class CloudAppTests(CloudAppHarness):
     def test_login_dns_failure_shows_safe_error_without_traceback(self):
         self.fail_auth = True
         app = self.app().run()
@@ -171,7 +176,10 @@ class CloudAppTests(unittest.TestCase):
         self.assertIn(RESULT["feedback"], self.rendered(app))
         app.run()
         self.assert_safe(app)
-        self.grade.assert_called_once_with(QUESTION["question"], QUESTION["rubric"], ANSWER)
+        self.grade.assert_called_once_with(
+            QUESTION["question"], QUESTION["rubric"], ANSWER,
+            extra_points=QUESTION["extra_points"],
+        )
         review_posts = [request for request in self.requests if request[0] == "POST" and "/rest/v1/reviews" in request[1]]
         self.assertEqual(len(review_posts), 1, "Uncertain review inserts must not be retried automatically")
         self.assertEqual(json.loads(review_posts[0][2])["user_answer"], ANSWER)
