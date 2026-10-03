@@ -9,10 +9,11 @@ from __future__ import annotations
 
 import json
 import random
-import urllib.error
 import urllib.request
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+
+from cloud_connection import CloudServiceError, request_json
 
 ROOT = Path(__file__).parent
 QUESTIONS_JSON = ROOT / "questions.json"
@@ -21,6 +22,19 @@ SKIPPED_GRADE = "skipped"
 
 def _now() -> str:
     return datetime.now(timezone.utc).replace(tzinfo=None).isoformat(timespec="seconds")
+
+
+class ReviewScheduleError(CloudServiceError):
+    """The review is saved, so the caller must not submit it a second time."""
+
+    def __init__(self, grade: str, cause: CloudServiceError):
+        super().__init__(
+            "本次作答记录已保存，但复习安排未确认更新。请勿重复提交本题；稍后查看统计或重新登录后继续。",
+            kind="schedule", status=cause.status,
+            write_may_have_succeeded=cause.write_may_have_succeeded,
+        )
+        self.grade = grade
+        self.review_saved = True
 
 
 class SupabaseStore:
@@ -41,14 +55,12 @@ class SupabaseStore:
         if prefer:
             headers["Prefer"] = prefer
         data = json.dumps(payload).encode("utf-8") if payload is not None else None
-        req = urllib.request.Request(self.url + path, data=data, headers=headers, method=method)
         try:
-            with urllib.request.urlopen(req, timeout=20) as response:
-                raw = response.read().decode("utf-8")
-                return json.loads(raw) if raw else []
-        except urllib.error.HTTPError as exc:
-            detail = exc.read().decode("utf-8", errors="replace")
-            raise RuntimeError(f"云端数据服务错误：{detail}") from exc
+            req = urllib.request.Request(self.url + path, data=data, headers=headers, method=method)
+        except ValueError:
+            raise CloudServiceError("云端连接异常，请联系管理员检查 Supabase 项目状态。",
+                                    kind="configuration") from None
+        return request_json(req, timeout=20)
 
     def _reviews(self):
         return self._request("GET", "/rest/v1/reviews?select=*&order=created_at.desc")
@@ -137,7 +149,10 @@ class SupabaseStore:
             "elapsed_sec": elapsed_sec, "model": model, "created_at": _now(),
         }
         self._request("POST", "/rest/v1/reviews", payload, "return=minimal")
-        self.schedule(question_id, grade)
+        try:
+            self.schedule(question_id, grade)
+        except CloudServiceError as exc:
+            raise ReviewScheduleError(grade, exc) from None
         return grade
 
     def stats_overview(self):

@@ -147,3 +147,26 @@ interview-trainer/
 - **离线模式**（无 API Key）用的是字符重叠度粗判，准确度远不如 AI，只够跑通流程。
 - 解析器是按你这套文档格式定制的。如果 docx 结构大改，需要同步调整 `parse_docx.py` 里的规则。
 - 目前 378 题中约 3 处因原文格式特殊未识别，已记录在解析日志的 warnings 里。
+
+
+## 云端连接故障与恢复
+
+上线版使用 Supabase 保存账户、错题本和个人练习记录。题库保存在仓库中。
+
+如果登录时或进入应用后提示云端服务无法连接：
+
+1. 管理员打开 Supabase Dashboard，查看部署时所用项目的状态。
+2. 如果状态为 **Paused**，点击 **Restore project / Resume project** 并等待恢复完成。
+3. 如果项目正常，检查 Streamlit Secrets 中的 `SUPABASE_URL` 是否对应当前项目；项目域名应以 `.supabase.co` 结尾。
+4. 服务恢复后点击应用中的 **重试连接**；登录过期时点击 **重新登录**。
+
+Supabase 的免费项目可能因一段时间活动不足而自动暂停。官方说明：
+https://supabase.com/docs/guides/platform/free-project-pausing
+
+暂停的项目可能停止解析其域名，导致 DNS / NXDOMAIN 错误。官方排查说明：
+https://supabase.com/docs/guides/troubleshooting/nxdomain-error-connecting-to-a-supabase-project
+
+连接失败时应用显示可恢复的提示，不把无法读取的记录当作空记录，也不会切换到共享的本地数据库。
+已经完成的评分和答案会保留在当前会话中，并标明云端保存状态。网络写入失败时不会自动重复提交；恢复后先查看统计页的最近作答记录，以免重复记录。若评分已经保存而复习安排更新失败，会分别提示。
+
+尚未确认保存的内容仅保留在当前浏览器会话中。关闭或刷新页面前，请先复制本次答案。

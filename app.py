@@ -9,9 +9,6 @@ import hmac
 import json
 import os
 import time
-import json as _json
-import urllib.error
-import urllib.request
 from datetime import datetime
 
 import pandas as pd
@@ -19,7 +16,8 @@ import streamlit as st
 
 import grader
 import store
-from supabase_store import SupabaseStore
+from supabase_store import SupabaseStore, ReviewScheduleError
+from cloud_connection import CloudServiceError, auth_request
 
 st.set_page_config(
     page_title="面试题背题助手",
@@ -146,17 +144,7 @@ def _cloud_config() -> tuple[str, str]:
 
 
 def _supabase_auth(url: str, key: str, action: str, email: str, password: str) -> dict:
-    data = _json.dumps({"email": email, "password": password}).encode("utf-8")
-    req = urllib.request.Request(
-        f"{url.rstrip('/')}/auth/v1/{action}", data=data, method="POST",
-        headers={"apikey": key, "Content-Type": "application/json"},
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=20) as res:
-            return _json.loads(res.read().decode("utf-8"))
-    except urllib.error.HTTPError as exc:
-        detail = _json.loads(exc.read().decode("utf-8", errors="replace"))
-        raise ValueError(detail.get("msg") or detail.get("message") or "登录失败") from exc
+    return auth_request(url, key, action, email, password)
 
 
 def require_user() -> None:
@@ -176,7 +164,7 @@ def require_user() -> None:
                     data = _supabase_auth(url, key, "token?grant_type=password", email, password)
                     st.session_state["cloud_user"] = {"id": data["user"]["id"], "token": data["access_token"], "email": data["user"]["email"]}
                     st.rerun()
-                except (ValueError, KeyError) as exc:
+                except (CloudServiceError, ValueError, KeyError) as exc:
                     st.error(str(exc))
         with tab_register:
             email = st.text_input("邮箱", key="register_email")
@@ -188,7 +176,7 @@ def require_user() -> None:
                         st.session_state["cloud_user"] = {"id": data["user"]["id"], "token": data["access_token"], "email": data["user"]["email"]}
                         st.rerun()
                     st.success("注册成功，请到邮箱点击验证链接后再登录。")
-                except ValueError as exc:
+                except (CloudServiceError, ValueError, KeyError) as exc:
                     st.error(str(exc))
         st.stop()
     user = st.session_state["cloud_user"]
@@ -224,6 +212,7 @@ def ensure_state() -> None:
         "show_answer": False,     # 是否已放弃并看答案
         "session_done": 0,        # 本次会话已做题数
         "session_scores": [],     # 本次会话得分
+        "save_notice": "",        # 云端保存状态，保留至换题
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -231,6 +220,7 @@ def ensure_state() -> None:
 
 
 ensure_state()
+_answer_widget_rendered = False
 
 
 def _filters_changed() -> None:
@@ -238,6 +228,7 @@ def _filters_changed() -> None:
     st.session_state["current"] = None
     st.session_state["result"] = None
     st.session_state["show_answer"] = False
+    st.session_state["save_notice"] = ""
     _reset_answer_box()
 
 
@@ -415,6 +406,7 @@ def _load_next(force: bool = False) -> None:
     st.session_state["current"] = q
     st.session_state["result"] = None
     st.session_state["show_answer"] = False
+    st.session_state["save_notice"] = ""
     _reset_answer_box()
     st.session_state["started_at"] = time.time()
 
@@ -525,6 +517,7 @@ def render_result(res: dict, q: dict) -> None:
 # ------------------------------------------------------------------ 页面：背题
 
 def page_practice() -> None:
+    global _answer_widget_rendered
     _load_next()
     q = st.session_state["current"]
 
@@ -561,6 +554,7 @@ def page_practice() -> None:
     if res is None:
         st.markdown("##### ✍️ 用你自己的话答一遍")
         st.caption("不用背原文，把要点说清楚就行。AI 会按要点覆盖情况判分。")
+        _answer_widget_rendered = True
         answer = st.text_area(
             "你的答案", key=f"answer_input_{st.session_state['answer_nonce']}", height=200,
             placeholder="在这里写下你的回答……\n\n提示：分点写更容易被判定命中，比如「1) …… 2) ……」",
@@ -587,11 +581,21 @@ def page_practice() -> None:
                         st.error(f"判分失败：{e}")
                         r = None
                     if r:
-                        store.record_review(q["id"], answer, r, elapsed_sec=elapsed,
-                                            model=r.get("model", ""))
+                        # Keep the completed answer and grade even if cloud storage fails.
                         st.session_state["result"] = r
                         st.session_state["session_done"] += 1
                         st.session_state["session_scores"].append(r["score"])
+                        st.session_state["save_notice"] = ""
+                        try:
+                            store.record_review(q["id"], answer, r, elapsed_sec=elapsed,
+                                                model=r.get("model", ""))
+                        except ReviewScheduleError as exc:
+                            st.session_state["save_notice"] = str(exc)
+                        except CloudServiceError as exc:
+                            st.session_state["save_notice"] = (
+                                "评分已保留在本次会话中，但云端保存尚未确认。"
+                                "请保留本页，服务恢复后在统计页检查最近作答记录。 " + str(exc)
+                            )
                         st.rerun()
 
         if st.session_state["show_answer"]:
@@ -632,6 +636,8 @@ def page_practice() -> None:
 
     # ---- 判分结果 ----
     else:
+        if st.session_state.get("save_notice"):
+            st.warning(st.session_state["save_notice"])
         render_result(res, q)
         st.divider()
         c1, c2, c3 = st.columns([1, 1, 3])
@@ -836,5 +842,43 @@ def main() -> None:
         page_stats()
 
 
+def show_cloud_error(exc: CloudServiceError) -> None:
+    """Show a recoverable failure without treating unavailable records as empty."""
+    st.error(str(exc))
+    st.caption("云端记录暂时无法读取，你的原有记录不会在这里被清空。")
+    c1, c2 = st.columns(2)
+    if c1.button("重试连接", type="primary", width="stretch"):
+        st.rerun()
+    if "cloud_user" in st.session_state and c2.button("重新登录", width="stretch"):
+        del st.session_state["cloud_user"]
+        st.rerun()
+
+    q = st.session_state.get("current")
+    if q:
+        # A widget value may be newer than answer_text if the sidebar failed first.
+        answer = st.session_state.get(
+            f"answer_input_{st.session_state['answer_nonce']}",
+            st.session_state.get("answer_text", ""),
+        )
+        st.session_state["answer_text"] = answer
+        st.markdown("### 本次作答")
+        st.markdown(html.escape(q["question"]))
+        if answer and not _answer_widget_rendered:
+            st.text_area(
+                "你的答案", key=f"answer_input_{st.session_state['answer_nonce']}",
+                height=200,
+                placeholder="在这里写下你的回答……\n\n提示：分点写更容易被判定命中，比如「1) …… 2) ……」",
+                label_visibility="collapsed", disabled=True,
+            )
+        if st.session_state.get("save_notice"):
+            st.warning(st.session_state["save_notice"])
+        if st.session_state.get("result"):
+            render_result(st.session_state["result"], q)
+        st.caption("本次作答保留在当前会话中，请先复制答案，再关闭或刷新浏览器。")
+
+
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except CloudServiceError as exc:
+        show_cloud_error(exc)
